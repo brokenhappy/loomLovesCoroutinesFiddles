@@ -96,11 +96,25 @@ private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : 
 
     override val executor: Executor get() = executorService
 
-    @OptIn(InternalCoroutinesApi::class)
     override fun dispatch(context: CoroutineContext, block: Runnable) {
         val job = context[Job]
         delegate.dispatch(context) {
-            val interruptOnCancel = job?.let(::InterruptOnCancel)
+            var handle: DisposableHandle? = null
+            // Same 4-state handshake kotlinx.coroutines' own runInterruptible uses internally (see its
+            // ThreadState): a cancellation can race with the task's natural completion, so this guarantees we
+            // never interrupt a thread that has already moved on, and never leave a stray interrupt flag set
+            // once clear() returns.
+            val state = AtomicInteger(WORKING)
+            if (job != null) {
+                val targetThread = Thread.currentThread()
+                @OptIn(InternalCoroutinesApi::class)
+                handle = job.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+                    if (cause != null && state.compareAndSet(WORKING, INTERRUPTING)) {
+                        targetThread.interrupt()
+                        state.set(INTERRUPTED)
+                    }
+                }
+            }
             try {
                 bindings.overwriteAllValues {
                     ScopedValue.where(contextAsScopedValue, context).run {
@@ -108,7 +122,21 @@ private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : 
                     }
                 }
             } finally {
-                interruptOnCancel?.clear()
+                if (job != null) {
+                    while (true) {
+                        when (state.get()) {
+                            WORKING -> if (state.compareAndSet(WORKING, FINISHED)) {
+                                handle?.dispose()
+                                break
+                            }
+                            INTERRUPTING -> Thread.onSpinWait()
+                            else -> { // INTERRUPTED
+                                Thread.interrupted() // drop the flag so it can't leak past this task
+                                break
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -120,36 +148,4 @@ private const val WORKING = 0
 private const val FINISHED = 1
 private const val INTERRUPTING = 2
 private const val INTERRUPTED = 3
-
-// Same 4-state handshake kotlinx.coroutines' own runInterruptible uses internally (see its
-// ThreadState): a cancellation can race with the task's natural completion, so this guarantees we
-// never interrupt a thread that has already moved on, and never leave a stray interrupt flag set
-// once clear() returns.
-@OptIn(InternalCoroutinesApi::class)
-private class InterruptOnCancel(job: Job) {
-    private val state = AtomicInteger(WORKING)
-    private val targetThread = Thread.currentThread()
-    private val handle: DisposableHandle = job.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
-        if (cause != null && state.compareAndSet(WORKING, INTERRUPTING)) {
-            targetThread.interrupt()
-            state.set(INTERRUPTED)
-        }
-    }
-
-    fun clear() {
-        while (true) {
-            when (state.get()) {
-                WORKING -> if (state.compareAndSet(WORKING, FINISHED)) {
-                    handle.dispose()
-                    return
-                }
-                INTERRUPTING -> Thread.onSpinWait()
-                else -> { // INTERRUPTED
-                    Thread.interrupted() // drop the flag so it can't leak past this task
-                    return
-                }
-            }
-        }
-    }
-}
 
