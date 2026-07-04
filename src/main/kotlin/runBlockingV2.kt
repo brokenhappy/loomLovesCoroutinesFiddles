@@ -27,9 +27,13 @@ fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
 
     @OptIn(DelicateCoroutinesApi::class)
     val job = GlobalScope.launch(
-        LoomCompatibleCoroutineDispatcher(captureAllScopedValueBindings())
-            .plus(contextAsScopedValue.get())
-            .minusKey(Job)
+        LoomCompatibleCoroutineDispatcher(captureAllScopedValueBindings()).let { context ->
+            if (contextAsScopedValue.isBound) {
+                context
+                    .plus(contextAsScopedValue.get())
+                    .minusKey(Job)
+            } else context
+        }
     ) {
         result.state = try {
             block()
