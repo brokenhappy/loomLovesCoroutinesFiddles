@@ -22,7 +22,7 @@ import kotlin.jvm.Throws
 private val contextAsScopedValue = ScopedValue.newInstance<CoroutineContext>()
 
 @Throws(InterruptedException::class)
-fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
+fun <T> loomToCoroutines(block: suspend CoroutineScope.() -> T): T {
     // Unique type that we can type cast on. Now we only allocate this in the exception case,
     // but the happy path needs no extra allocations.
     class ThrowableWrapper(val throwable: Throwable)

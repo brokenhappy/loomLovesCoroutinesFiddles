@@ -25,14 +25,14 @@ class RunBlockingV2Test {
 
     @Test
     fun `returns the block's result`() {
-        assertEquals(42, runBlockingV2 { 42 })
+        assertEquals(42, loomToCoroutines { 42 })
     }
 
     @Test
     fun `propagates an exception thrown directly in the block`() {
         class Boom : RuntimeException()
         val e = assertFailsWith<Boom> {
-            runBlockingV2 { throw Boom() }
+            loomToCoroutines { throw Boom() }
         }
         assertIs<Boom>(e)
     }
@@ -41,7 +41,7 @@ class RunBlockingV2Test {
     fun `propagates an exception thrown by a suspending child, after an actual suspension`() {
         class Boom : RuntimeException()
         assertFailsWith<Boom> {
-            runBlockingV2 {
+            loomToCoroutines {
                 yield() // force a real suspend+resume before throwing
                 throw Boom()
             }
@@ -52,7 +52,7 @@ class RunBlockingV2Test {
     fun `sees the ScopedValues bound on the calling thread`() {
         val requestId = ScopedValue.newInstance<String>()
         val seen = ScopedValue.where(requestId, "outer-caller").call<String, RuntimeException> {
-            runBlockingV2 { requestId.get() }
+            loomToCoroutines { requestId.get() }
         }
         assertEquals("outer-caller", seen)
     }
@@ -65,7 +65,7 @@ class RunBlockingV2Test {
 
         val callerThread = Thread {
             try {
-                runBlockingV2 {
+                loomToCoroutines {
                     started.countDown()
                     try {
                         delay(60.seconds)
@@ -98,7 +98,7 @@ class RunBlockingV2Test {
     fun `ScopedValues are still bound after a delay() suspension`() {
         val requestId = ScopedValue.newInstance<String>()
         val seen = ScopedValue.where(requestId, "after-delay").call<String, RuntimeException> {
-            runBlockingV2 {
+            loomToCoroutines {
                 delay(50.milliseconds)
                 requestId.get()
             }
@@ -108,7 +108,7 @@ class RunBlockingV2Test {
 
     @Test
     fun `execution resumes on a virtual thread after a delay(), not the global default delay thread`() {
-        val isVirtual = runBlockingV2 {
+        val isVirtual = loomToCoroutines {
             delay(50.milliseconds)
             Thread.currentThread().isVirtual
         }
@@ -119,7 +119,7 @@ class RunBlockingV2Test {
     fun `cancelling a coroutine suspended in delay() completes via normal cancellation, not interruption`() {
         val started = CountDownLatch(1)
         var wasCancelled = false
-        runBlockingV2 {
+        loomToCoroutines {
             val job = launch {
                 started.countDown()
                 delay(7.seconds)
@@ -143,7 +143,7 @@ class RunBlockingV2Test {
         val interrupted = CountDownLatch(sleeperCount)
 
         val elapsed = measureTime {
-            runBlockingV2 {
+            loomToCoroutines {
                 val jobs = List(sleeperCount) {
                     launch {
                         started.countDown()
@@ -176,7 +176,7 @@ class RunBlockingV2Test {
     @Test
     fun `a runBlockingV2 forked as a Java subtask returns its value normally`() {
         val result = structuredTaskScope {
-            fork { runBlockingV2 { 7 * 6 } }
+            fork { loomToCoroutines { 7 * 6 } }
         }.get()
         assertEquals(42, result)
     }
@@ -186,7 +186,7 @@ class RunBlockingV2Test {
         val requestId = ScopedValue.newInstance<String>()
         val result = ScopedValue.where(requestId, "java-root").call<String, RuntimeException> {
             structuredTaskScope {
-                fork { runBlockingV2 { requestId.get() } }
+                fork { loomToCoroutines { requestId.get() } }
             }.get()
         }
         assertEquals("java-root", result)
@@ -202,7 +202,7 @@ class RunBlockingV2Test {
         assertFailsWith<Boom> {
             structuredTaskScope {
                 fork {
-                    runBlockingV2 {
+                    loomToCoroutines {
                         innerStarted.countDown()
                         try {
                             delay(60.seconds)
@@ -228,7 +228,7 @@ class RunBlockingV2Test {
 
     @Test
     fun `a Job forking a Java StructuredTaskScope propagates its subtask's result back into the coroutine`() {
-        val result = runBlockingV2 {
+        val result = loomToCoroutines {
             structuredTaskScope { fork { 6 * 7 } }.get()
         }
         assertEquals(42, result)
@@ -238,7 +238,7 @@ class RunBlockingV2Test {
     fun `an exception from a forked Java subtask surfaces inside the coroutine directly, unwrapped`() {
         class Boom : RuntimeException("boom")
         assertFailsWith<Boom> {
-            runBlockingV2 {
+            loomToCoroutines {
                 structuredTaskScope {
                     fork { throw Boom() }
                 }
@@ -252,7 +252,7 @@ class RunBlockingV2Test {
         val subtaskInterrupted = CountDownLatch(1)
         val coroutineSawInterruption = CountDownLatch(1)
 
-        runBlockingV2 {
+        loomToCoroutines {
             val job = launch {
                 try {
                     structuredTaskScope {
@@ -291,7 +291,7 @@ class RunBlockingV2Test {
             Thread {
                 val expected = "caller-$i"
                 val seen = ScopedValue.where(requestId, expected).call<String, RuntimeException> {
-                    runBlockingV2 {
+                    loomToCoroutines {
                         yield() // give other callers a chance to interleave before reading back
                         requestId.get()
                     }
@@ -311,16 +311,16 @@ class RunBlockingV2Test {
 
     @Test
     fun `a top-level runBlockingV2 with nothing bound just runs with an empty context`() {
-        val name = runBlockingV2 { coroutineContext[CoroutineName]?.name }
+        val name = loomToCoroutines { coroutineContext[CoroutineName]?.name }
         assertEquals(null, name)
     }
 
     @Test
     fun `a nested runBlockingV2 inherits CoroutineContext elements from the enclosing coroutine`() {
-        val seen = runBlockingV2 {
+        val seen = loomToCoroutines {
             withContext(CoroutineName("outer-name")) {
                 yield() // force a real redispatch - see the "KNOWN LIMITATION" test below for why
-                runBlockingV2 { coroutineContext[CoroutineName]?.name }
+                loomToCoroutines { coroutineContext[CoroutineName]?.name }
             }
         }
         assertEquals("outer-name", seen)
@@ -334,9 +334,9 @@ class RunBlockingV2Test {
         // called immediately afterward (no suspension in between) still sees the *old* ScopedValue
         // snapshot. A real suspension point (yield(), delay(), a dispatcher switch, ...) in between
         // fixes it, as the test above demonstrates.
-        val seen = runBlockingV2 {
+        val seen = loomToCoroutines {
             withContext(CoroutineName("outer-name")) {
-                runBlockingV2 { coroutineContext[CoroutineName]?.name }
+                loomToCoroutines { coroutineContext[CoroutineName]?.name }
             }
         }
         assertEquals(null, seen)
@@ -348,13 +348,13 @@ class RunBlockingV2Test {
 
         data class Seen(val outer: String?, val inner: String?)
 
-        val seen = runBlockingV2 {
+        val seen = loomToCoroutines {
             withContext(outerName) {
                 yield()
-                runBlockingV2 {
+                loomToCoroutines {
                     withContext(CoroutineName("inner")) {
                         yield()
-                        runBlockingV2 {
+                        loomToCoroutines {
                             Seen(
                                 outer = coroutineContext[CoroutineName]?.name,
                                 inner = coroutineContext[CoroutineName]?.name,
@@ -377,10 +377,10 @@ class RunBlockingV2Test {
         val threads = List(callers) { i ->
             Thread {
                 val expected = "caller-$i"
-                val seen = runBlockingV2 {
+                val seen = loomToCoroutines {
                     withContext(CoroutineName(expected)) {
                         yield() // give other callers a chance to interleave
-                        runBlockingV2 { coroutineContext[CoroutineName]?.name }
+                        loomToCoroutines { coroutineContext[CoroutineName]?.name }
                     }
                 }
                 if (seen != expected) mismatches.incrementAndGet()
@@ -394,11 +394,11 @@ class RunBlockingV2Test {
 
     @Test
     fun `CoroutineContext propagates through a Java StructuredTaskScope fork into a nested runBlockingV2`() {
-        val seen = runBlockingV2 {
+        val seen = loomToCoroutines {
             withContext(CoroutineName("across-the-fork")) {
                 yield() // force a real redispatch so contextAsScopedValue picks up the new name
                 structuredTaskScope {
-                    fork { runBlockingV2 { coroutineContext[CoroutineName]?.name } }
+                    fork { loomToCoroutines { coroutineContext[CoroutineName]?.name } }
                 }.get()
             }
         }
@@ -411,9 +411,9 @@ class RunBlockingV2Test {
         // inner one a child of a coroutine that has already returned by the time the inner starts.
         var outerJob: kotlinx.coroutines.Job? = null
         var innerJob: kotlinx.coroutines.Job? = null
-        runBlockingV2 {
+        loomToCoroutines {
             outerJob = coroutineContext[kotlinx.coroutines.Job]
-            runBlockingV2 {
+            loomToCoroutines {
                 innerJob = coroutineContext[kotlinx.coroutines.Job]
             }
         }
