@@ -47,9 +47,14 @@ fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
         LockSupport.park()
     } while (!thread.isInterrupted && !wasUnparked.get())
 
-    if (thread.isInterrupted) {
+
+    if (Thread.interrupted()) {
         job.cancel()
-        while (!wasUnparked.get()) LockSupport.park()
+        while (!wasUnparked.get()) {
+            LockSupport.park()
+            Thread.interrupted() // clear flag so we don't busy loop
+        }
+        thread.interrupt() // Set flag back
     }
     @Suppress("UNCHECKED_CAST")
     val throwable = (result.state as? ThrowableWrapper)?.throwable
