@@ -26,7 +26,7 @@ fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
     }
 
     @OptIn(DelicateCoroutinesApi::class)
-    GlobalScope.launch(
+    val job = GlobalScope.launch(
         LoomCompatibleCoroutineDispatcher(captureAllScopedValueBindings())
             .plus(contextAsScopedValue.get())
             .minusKey(Job)
@@ -36,21 +36,25 @@ fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
         } catch (t: Throwable) {
             ThrowableWrapper(t)
         }
-    }.invokeOnCompletion {
-        wasUnparked.set(true)
-        LockSupport.unpark(thread)
+    }.apply {
+        invokeOnCompletion {
+            wasUnparked.set(true)
+            LockSupport.unpark(thread)
+        }
     }
 
     do {
         LockSupport.park()
     } while (!thread.isInterrupted && !wasUnparked.get())
 
+    if (thread.isInterrupted) {
+        job.cancel()
+        while (!wasUnparked.get()) LockSupport.park()
+    }
     @Suppress("UNCHECKED_CAST")
     val throwable = (result.state as? ThrowableWrapper)?.throwable
-    if (thread.isInterrupted) {
-        throw InterruptedException().apply {
-            throwable?.let { addSuppressed(throwable) }
-        }
+    if (thread.isInterrupted) throw InterruptedException().apply {
+        throwable?.let { addSuppressed(throwable) }
     }
     throwable?.let { throw it }
 
