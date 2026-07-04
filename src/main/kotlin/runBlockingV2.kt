@@ -103,7 +103,9 @@ private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : 
             val interruptOnCancel = job?.let(::InterruptOnCancel)
             try {
                 bindings.overwriteAllValues {
-                    block.run()
+                    ScopedValue.where(contextAsScopedValue, context).run {
+                        block.run()
+                    }
                 }
             } finally {
                 interruptOnCancel?.clear()
