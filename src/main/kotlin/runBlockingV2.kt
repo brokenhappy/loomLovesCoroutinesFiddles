@@ -25,15 +25,13 @@ fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
         var state: Any? = null // Bc Kotlin doesn't support local `@Volatile`s
     }
 
+    val inheritedContext =
+        if (contextAsScopedValue.isBound) contextAsScopedValue.get().minusKey(Job)
+        else kotlin.coroutines.EmptyCoroutineContext
+
     @OptIn(DelicateCoroutinesApi::class)
     val job = GlobalScope.launch(
-        LoomCompatibleCoroutineDispatcher(captureAllScopedValueBindings()).let { context ->
-            if (contextAsScopedValue.isBound) {
-                context
-                    .plus(contextAsScopedValue.get())
-                    .minusKey(Job)
-            } else context
-        }
+        LoomCompatibleCoroutineDispatcher(captureAllScopedValueBindings()).plus(inheritedContext)
     ) {
         result.state = try {
             block()
