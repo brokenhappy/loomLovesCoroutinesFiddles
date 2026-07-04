@@ -61,5 +61,5 @@ fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
     @Suppress("UNCHECKED_CAST")
     return (result.state as? ThrowableWrapper)
         ?.let { throw it.throwable }
-        ?: result as T
+        ?: result.state as T
 }
