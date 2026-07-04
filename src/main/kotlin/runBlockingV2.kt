@@ -1,4 +1,3 @@
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.DisposableHandle
@@ -142,6 +141,21 @@ private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : 
     }
 
     override fun close() = TODO("Idk why this would happen atm")
+}
+
+suspend fun <T> coroutinesToLoom(unwrapExecutionException: Boolean = true, block: () -> T): T {
+    return try {
+        ScopedValue.where(contextAsScopedValue, currentCoroutineContext()).call<T, Throwable> {
+            block()
+        }
+    } catch (t: Throwable) {
+        val job = currentCoroutineContext().job
+        val exception = if (unwrapExecutionException) (t as? ExecutionException)?.cause ?: t else t
+        @OptIn(InternalCoroutinesApi::class)
+        throw if (job.isActive) {
+            job.getCancellationException().apply { addSuppressed(exception) }
+        } else exception
+    }
 }
 
 private const val WORKING = 0
