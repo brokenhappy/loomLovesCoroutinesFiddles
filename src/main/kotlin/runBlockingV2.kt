@@ -26,7 +26,11 @@ fun <T> runBlockingV2(block: suspend CoroutineScope.() -> T): T {
     }
 
     @OptIn(DelicateCoroutinesApi::class)
-    GlobalScope.launch(contextAsScopedValue.get().minusKey(Job)) {
+    GlobalScope.launch(
+        LoomCompatibleCoroutineDispatcher(captureAllScopedValueBindings())
+            .plus(contextAsScopedValue.get())
+            .minusKey(Job)
+    ) {
         result.state = try {
             block()
         } catch (t: Throwable) {
