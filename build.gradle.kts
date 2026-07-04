@@ -27,11 +27,11 @@ kotlin {
 
 tasks.test {
     useJUnitPlatform()
-    jvmArgs("--enable-preview")
+    jvmArgs("--enable-preview", "--add-opens=java.base/java.lang=ALL-UNNAMED")
 }
 
 tasks.withType<JavaExec>().configureEach {
-    jvmArgs("--enable-preview")
+    jvmArgs("--enable-preview", "--add-opens=java.base/java.lang=ALL-UNNAMED")
 }
 
 tasks.withType<JavaCompile>().configureEach {
