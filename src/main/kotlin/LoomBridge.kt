@@ -17,6 +17,10 @@ import kotlin.jvm.Throws
 
 private val contextAsScopedValue = ScopedValue.newInstance<CoroutineContext>()
 
+/**
+ * Enters the coroutine world.
+ * This **WILL** block the thread, and **will** be expensive on platform threads.
+ */
 @Throws(InterruptedException::class)
 fun <T> loomToCoroutines(block: suspend CoroutineScope.() -> T): T {
     // Unique type that we can type cast on. Now we only allocate this in the exception case,
