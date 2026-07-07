@@ -1,3 +1,6 @@
+import loom.ScopedBindings
+import loom.captureAllScopedValueBindings
+import loom.overwriteAllValues
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

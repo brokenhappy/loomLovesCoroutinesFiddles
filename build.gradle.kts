@@ -2,6 +2,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     kotlin("jvm") version "2.4.0"
+    id("me.champeau.jmh") version "0.7.3"
 }
 
 group = "dev.wout"
@@ -28,6 +29,11 @@ kotlin {
 tasks.test {
     useJUnitPlatform()
     jvmArgs("--enable-preview", "--add-opens=java.base/java.lang=ALL-UNNAMED")
+}
+
+jmh {
+    jmhVersion.set("1.37")
+    jvmArgs.set(listOf("--enable-preview", "--add-opens=java.base/java.lang=ALL-UNNAMED"))
 }
 
 tasks.withType<JavaExec>().configureEach {
