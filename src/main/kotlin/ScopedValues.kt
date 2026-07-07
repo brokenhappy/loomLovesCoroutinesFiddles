@@ -11,11 +11,11 @@ internal class ScopedBindings(val raw: Any?)
 
 internal fun captureAllScopedValueBindings(): ScopedBindings = ScopedBindings(ScopedValueInternals.currentBindings())
 
-internal fun ScopedBindings.overwriteAllValues(block: () -> Unit) {
+internal fun <T> ScopedBindings.overwriteAllValues(block: () -> T): T {
     val previous = ScopedValueInternals.currentBindings()
     ScopedValueInternals.installBindings(raw)
     try {
-        block()
+        return block()
     } finally {
         ScopedValueInternals.installBindings(previous)
     }

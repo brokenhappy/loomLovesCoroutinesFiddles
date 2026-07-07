@@ -4,7 +4,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.StructuredTaskScope
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -13,14 +16,16 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTime
+
+private inline fun <reified T : Throwable> Throwable.chainContains(): Boolean =
+    generateSequence(this) { it.cause }.any { it is T }
 
 class LoomBridgeTest {
 
     // ------------------------------------------------------------------
-    // Basics: return values, exceptions, ScopedValues, thread interruption
+    // loomToCoroutines: bridging FROM blocking Loom code INTO coroutines
     // ------------------------------------------------------------------
 
     @Test
@@ -31,10 +36,9 @@ class LoomBridgeTest {
     @Test
     fun `propagates an exception thrown directly in the block`() {
         class Boom : RuntimeException()
-        val e = assertFailsWith<Boom> {
+        assertFailsWith<Boom> {
             loomToCoroutines { throw Boom() }
         }
-        assertIs<Boom>(e)
     }
 
     @Test
@@ -46,15 +50,6 @@ class LoomBridgeTest {
                 throw Boom()
             }
         }
-    }
-
-    @Test
-    fun `sees the ScopedValues bound on the calling thread`() {
-        val requestId = ScopedValue.newInstance<String>()
-        val seen = ScopedValue.where(requestId, "outer-caller").call<String, RuntimeException> {
-            loomToCoroutines { requestId.get() }
-        }
-        assertEquals("outer-caller", seen)
     }
 
     @Test
@@ -90,50 +85,183 @@ class LoomBridgeTest {
     }
 
     // ------------------------------------------------------------------
-    // Delay support (formerly tested against the dispatcher directly; that class is now a
-    // private implementation detail of runBlockingV2, so these go through the public API instead)
+    // coroutinesToLoom: bridging FROM a coroutine back INTO blocking Loom code
     // ------------------------------------------------------------------
 
     @Test
-    fun `ScopedValues are still bound after a delay() suspension`() {
-        val requestId = ScopedValue.newInstance<String>()
-        val seen = ScopedValue.where(requestId, "after-delay").call<String, RuntimeException> {
-            loomToCoroutines {
-                delay(50.milliseconds)
-                requestId.get()
-            }
-        }
-        assertEquals("after-delay", seen)
+    fun `coroutinesToLoom returns the block's result`() {
+        val result = loomToCoroutines { coroutinesToLoom { 6 * 7 } }
+        assertEquals(42, result)
     }
 
     @Test
-    fun `execution resumes on a virtual thread after a delay(), not the global default delay thread`() {
-        val isVirtual = loomToCoroutines {
-            delay(50.milliseconds)
-            Thread.currentThread().isVirtual
-        }
+    fun `coroutinesToLoom runs the block on a virtual thread`() {
+        val isVirtual = loomToCoroutines { coroutinesToLoom { Thread.currentThread().isVirtual } }
         assertTrue(isVirtual)
     }
 
     @Test
-    fun `cancelling a coroutine suspended in delay() completes via normal cancellation, not interruption`() {
+    fun `coroutinesToLoom exposes the ScopedValues captured at the enclosing loomToCoroutines`() {
+        val requestId = ScopedValue.newInstance<String>()
+        val seen = ScopedValue.where(requestId, "outer-caller").call<String, RuntimeException> {
+            loomToCoroutines { coroutinesToLoom { requestId.get() } }
+        }
+        assertEquals("outer-caller", seen)
+    }
+
+    @Test
+    fun `coroutinesToLoom unwraps a raw StructuredTaskScope ExecutionException by default`() {
+        class Boom : RuntimeException("boom")
+        assertFailsWith<Boom> {
+            loomToCoroutines {
+                coroutinesToLoom {
+                    StructuredTaskScope.open<Unit>().use { scope ->
+                        scope.fork(Callable<Unit> { throw Boom() })
+                        scope.join()
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `coroutinesToLoom with unwrapExecutionException false preserves the ExecutionException`() {
+        class Boom : RuntimeException("boom")
+        val e = assertFailsWith<ExecutionException> {
+            loomToCoroutines {
+                coroutinesToLoom(unwrapExecutionException = false) {
+                    StructuredTaskScope.open<Unit>().use { scope ->
+                        scope.fork(Callable<Unit> { throw Boom() })
+                        scope.join()
+                    }
+                }
+            }
+        }
+        assertTrue(e.chainContains<Boom>())
+    }
+
+    @Test
+    fun `cancelling the coroutine while coroutinesToLoom's block runs interrupts it and surfaces as CancellationException`() {
         val started = CountDownLatch(1)
-        var wasCancelled = false
+        val interrupted = CountDownLatch(1)
         loomToCoroutines {
             val job = launch {
-                started.countDown()
-                delay(7.seconds)
+                try {
+                    coroutinesToLoom {
+                        started.countDown()
+                        Thread.sleep(60_000)
+                    }
+                } catch (e: CancellationException) {
+                    interrupted.countDown()
+                }
             }
             assertTrue(started.await(5, TimeUnit.SECONDS))
             job.cancel()
-            job.join()
-            wasCancelled = job.isCancelled
         }
-        assertTrue(wasCancelled)
+        assertTrue(interrupted.await(5, TimeUnit.SECONDS))
     }
 
     // ------------------------------------------------------------------
-    // Scalability: virtual threads must not exhaust like a platform pool would
+    // CoroutineContext propagation: only guaranteed across an explicit coroutinesToLoom crossing
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `a nested loomToCoroutines inherits CoroutineContext elements from the enclosing coroutine, via coroutinesToLoom`() {
+        val seen = loomToCoroutines {
+            withContext(CoroutineName("outer-name")) {
+                coroutinesToLoom {
+                    loomToCoroutines { coroutineContext[CoroutineName]?.name }
+                }
+            }
+        }
+        assertEquals("outer-name", seen)
+    }
+
+    @Test
+    fun `calling loomToCoroutines directly from suspend code, skipping coroutinesToLoom, does not see the enclosing context`() {
+        // contextAsScopedValue (the ambient-context mirror) is only bound inside coroutinesToLoom's
+        // block. Calling loomToCoroutines straight from suspend code never crosses that bridge, so
+        // it can't see it - the narrower, but much simpler and more reliable, contract this design
+        // trades for versus threading everything through a custom dispatcher.
+        val seen = loomToCoroutines {
+            withContext(CoroutineName("outer-name")) {
+                loomToCoroutines { coroutineContext[CoroutineName]?.name }
+            }
+        }
+        assertEquals(null, seen)
+    }
+
+    @Test
+    fun `CoroutineContext accumulates through multiple levels of nested crossings`() {
+        data class Seen(val outer: String?, val inner: String?)
+
+        val seen = loomToCoroutines {
+            withContext(CoroutineName("outer")) {
+                coroutinesToLoom {
+                    loomToCoroutines {
+                        withContext(CoroutineName("inner")) {
+                            coroutinesToLoom {
+                                loomToCoroutines {
+                                    Seen(
+                                        outer = coroutineContext[CoroutineName]?.name,
+                                        inner = coroutineContext[CoroutineName]?.name,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // the innermost withContext wins for the (single-valued) CoroutineName key, but it proves
+        // the chain of nested crossings kept threading the ambient context through.
+        assertEquals(Seen(outer = "inner", inner = "inner"), seen)
+    }
+
+    @Test
+    fun `independent top-level loomToCoroutines calls on different threads never see each other's CoroutineContext`() {
+        val callers = 100
+        val mismatches = AtomicInteger(0)
+
+        val threads = List(callers) { i ->
+            Thread {
+                val expected = "caller-$i"
+                val seen = loomToCoroutines {
+                    withContext(CoroutineName(expected)) {
+                        coroutinesToLoom {
+                            loomToCoroutines { coroutineContext[CoroutineName]?.name }
+                        }
+                    }
+                }
+                if (seen != expected) mismatches.incrementAndGet()
+            }
+        }
+        threads.forEach { it.start() }
+        threads.forEach { it.join(20_000) }
+        assertTrue(threads.none { it.isAlive })
+        assertEquals(0, mismatches.get())
+    }
+
+    @Test
+    fun `a coroutine's own Job is not leaked into a nested loomToCoroutines's context`() {
+        // each loomToCoroutines launches its own root Job; inheriting the *outer* Job would make
+        // the inner one a child of a coroutine that has already returned by the time it starts.
+        var outerJob: kotlinx.coroutines.Job? = null
+        var innerJob: kotlinx.coroutines.Job? = null
+        loomToCoroutines {
+            outerJob = coroutineContext[kotlinx.coroutines.Job]
+            coroutinesToLoom {
+                loomToCoroutines {
+                    innerJob = coroutineContext[kotlinx.coroutines.Job]
+                }
+            }
+        }
+        assertTrue(outerJob !== innerJob)
+    }
+
+    // ------------------------------------------------------------------
+    // Scalability: virtual threads must not exhaust like a platform pool would.
+    // Interrupt-on-cancel is now only guaranteed for blocking calls wrapped in coroutinesToLoom.
     // ------------------------------------------------------------------
 
     @Test
@@ -148,8 +276,8 @@ class LoomBridgeTest {
                     launch {
                         started.countDown()
                         try {
-                            Thread.sleep(60_000)
-                        } catch (e: InterruptedException) {
+                            coroutinesToLoom { Thread.sleep(60_000) }
+                        } catch (e: CancellationException) {
                             interrupted.countDown()
                         }
                     }
@@ -174,7 +302,7 @@ class LoomBridgeTest {
     // ------------------------------------------------------------------
 
     @Test
-    fun `a runBlockingV2 forked as a Java subtask returns its value normally`() {
+    fun `a loomToCoroutines forked as a Java subtask returns its value normally`() {
         val result = structuredTaskScope {
             fork { loomToCoroutines { 7 * 6 } }
         }.get()
@@ -182,18 +310,18 @@ class LoomBridgeTest {
     }
 
     @Test
-    fun `ScopedValues bound on the Java side are visible inside a runBlockingV2 forked as a subtask`() {
+    fun `ScopedValues bound on the Java side are visible inside coroutinesToLoom within a forked loomToCoroutines`() {
         val requestId = ScopedValue.newInstance<String>()
         val result = ScopedValue.where(requestId, "java-root").call<String, RuntimeException> {
             structuredTaskScope {
-                fork { loomToCoroutines { requestId.get() } }
+                fork { loomToCoroutines { coroutinesToLoom { requestId.get() } } }
             }.get()
         }
         assertEquals("java-root", result)
     }
 
     @Test
-    fun `a sibling subtask's failure cancels a nested runBlockingV2, and loomScope surfaces the original failure unwrapped`() {
+    fun `a sibling subtask's failure cancels a nested loomToCoroutines, and structuredTaskScope surfaces the original failure unwrapped`() {
         class Boom : RuntimeException("boom")
 
         val innerStarted = CountDownLatch(1)
@@ -227,62 +355,68 @@ class LoomBridgeTest {
     // ------------------------------------------------------------------
 
     @Test
-    fun `a Job forking a Java StructuredTaskScope propagates its subtask's result back into the coroutine`() {
+    fun `a coroutine using coroutinesToLoom to fork a Java StructuredTaskScope propagates its subtask's result back`() {
         val result = loomToCoroutines {
-            structuredTaskScope { fork { 6 * 7 } }.get()
+            coroutinesToLoom {
+                structuredTaskScope { fork { 6 * 7 } }.get()
+            }
         }
         assertEquals(42, result)
     }
 
     @Test
-    fun `an exception from a forked Java subtask surfaces inside the coroutine directly, unwrapped`() {
+    fun `an exception from a forked Java subtask surfaces inside the coroutine via coroutinesToLoom, unwrapped`() {
         class Boom : RuntimeException("boom")
         assertFailsWith<Boom> {
             loomToCoroutines {
-                structuredTaskScope {
-                    fork { throw Boom() }
+                coroutinesToLoom {
+                    structuredTaskScope {
+                        fork { throw Boom() }
+                    }
                 }
             }
         }
     }
 
     @Test
-    fun `cancelling a coroutine blocked in a nested loomScope interrupts it and cleans up the forked subtask`() {
+    fun `cancelling a coroutine blocked in coroutinesToLoom running a nested structuredTaskScope interrupts it and cleans up the forked subtask`() {
         val subtaskStarted = CountDownLatch(1)
         val subtaskInterrupted = CountDownLatch(1)
-        val coroutineSawInterruption = CountDownLatch(1)
+        val coroutineSawCancellation = CountDownLatch(1)
 
         loomToCoroutines {
             val job = launch {
                 try {
-                    structuredTaskScope {
-                        fork {
-                            subtaskStarted.countDown()
-                            try {
-                                Thread.sleep(60_000)
-                            } catch (e: InterruptedException) {
-                                subtaskInterrupted.countDown()
+                    coroutinesToLoom {
+                        structuredTaskScope {
+                            fork {
+                                subtaskStarted.countDown()
+                                try {
+                                    Thread.sleep(60_000)
+                                } catch (e: InterruptedException) {
+                                    subtaskInterrupted.countDown()
+                                }
                             }
                         }
                     }
-                } catch (e: InterruptedException) {
-                    coroutineSawInterruption.countDown()
+                } catch (e: CancellationException) {
+                    coroutineSawCancellation.countDown()
                 }
             }
             assertTrue(subtaskStarted.await(5, TimeUnit.SECONDS))
             job.cancel()
         }
 
-        assertTrue(coroutineSawInterruption.await(5, TimeUnit.SECONDS))
+        assertTrue(coroutineSawCancellation.await(5, TimeUnit.SECONDS))
         assertTrue(subtaskInterrupted.await(5, TimeUnit.SECONDS))
     }
 
     // ------------------------------------------------------------------
-    // Isolation between concurrent runBlockingV2 calls sharing the executor
+    // Isolation between concurrent loomToCoroutines calls
     // ------------------------------------------------------------------
 
     @Test
-    fun `concurrent runBlockingV2 calls with different ScopedValues never see each other's values`() {
+    fun `concurrent loomToCoroutines calls with different ScopedValues never see each other's values`() {
         val requestId = ScopedValue.newInstance<String>()
         val callers = 200
         val mismatches = AtomicInteger(0)
@@ -291,10 +425,7 @@ class LoomBridgeTest {
             Thread {
                 val expected = "caller-$i"
                 val seen = ScopedValue.where(requestId, expected).call<String, RuntimeException> {
-                    loomToCoroutines {
-                        yield() // give other callers a chance to interleave before reading back
-                        requestId.get()
-                    }
+                    loomToCoroutines { coroutinesToLoom { requestId.get() } }
                 }
                 if (seen != expected) mismatches.incrementAndGet()
             }
@@ -303,120 +434,5 @@ class LoomBridgeTest {
         threads.forEach { it.join(20_000) }
         assertTrue(threads.none { it.isAlive })
         assertEquals(0, mismatches.get())
-    }
-
-    // ------------------------------------------------------------------
-    // CoroutineContext propagation across nested runBlockingV2 calls
-    // ------------------------------------------------------------------
-
-    @Test
-    fun `a top-level runBlockingV2 with nothing bound just runs with an empty context`() {
-        val name = loomToCoroutines { coroutineContext[CoroutineName]?.name }
-        assertEquals(null, name)
-    }
-
-    @Test
-    fun `a nested runBlockingV2 inherits CoroutineContext elements from the enclosing coroutine`() {
-        val seen = loomToCoroutines {
-            withContext(CoroutineName("outer-name")) {
-                yield() // force a real redispatch - see the "KNOWN LIMITATION" test below for why
-                loomToCoroutines { coroutineContext[CoroutineName]?.name }
-            }
-        }
-        assertEquals("outer-name", seen)
-    }
-
-    @Test
-    fun `KNOWN LIMITATION - a context change isn't visible to a nested runBlockingV2 without an intervening real dispatch`() {
-        // contextAsScopedValue is only rebound inside LoomCompatibleCoroutineDispatcher.dispatch().
-        // withContext(CoroutineName(...)) doesn't change the dispatcher, so kotlinx.coroutines takes
-        // its "undispatched" fast path and never calls dispatch() again - meaning a runBlockingV2
-        // called immediately afterward (no suspension in between) still sees the *old* ScopedValue
-        // snapshot. A real suspension point (yield(), delay(), a dispatcher switch, ...) in between
-        // fixes it, as the test above demonstrates.
-        val seen = loomToCoroutines {
-            withContext(CoroutineName("outer-name")) {
-                loomToCoroutines { coroutineContext[CoroutineName]?.name }
-            }
-        }
-        assertEquals(null, seen)
-    }
-
-    @Test
-    fun `CoroutineContext accumulates through multiple levels of nested runBlockingV2`() {
-        val outerName = CoroutineName("outer")
-
-        data class Seen(val outer: String?, val inner: String?)
-
-        val seen = loomToCoroutines {
-            withContext(outerName) {
-                yield()
-                loomToCoroutines {
-                    withContext(CoroutineName("inner")) {
-                        yield()
-                        loomToCoroutines {
-                            Seen(
-                                outer = coroutineContext[CoroutineName]?.name,
-                                inner = coroutineContext[CoroutineName]?.name,
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        // the innermost withContext wins for the (single-valued) CoroutineName key, but it proves
-        // the chain of nested runBlockingV2 calls kept threading the ambient context through.
-        assertEquals(Seen(outer = "inner", inner = "inner"), seen)
-    }
-
-    @Test
-    fun `independent top-level runBlockingV2 calls on different threads never see each other's CoroutineContext`() {
-        val callers = 100
-        val mismatches = AtomicInteger(0)
-
-        val threads = List(callers) { i ->
-            Thread {
-                val expected = "caller-$i"
-                val seen = loomToCoroutines {
-                    withContext(CoroutineName(expected)) {
-                        yield() // give other callers a chance to interleave
-                        loomToCoroutines { coroutineContext[CoroutineName]?.name }
-                    }
-                }
-                if (seen != expected) mismatches.incrementAndGet()
-            }
-        }
-        threads.forEach { it.start() }
-        threads.forEach { it.join(20_000) }
-        assertTrue(threads.none { it.isAlive })
-        assertEquals(0, mismatches.get())
-    }
-
-    @Test
-    fun `CoroutineContext propagates through a Java StructuredTaskScope fork into a nested runBlockingV2`() {
-        val seen = loomToCoroutines {
-            withContext(CoroutineName("across-the-fork")) {
-                yield() // force a real redispatch so contextAsScopedValue picks up the new name
-                structuredTaskScope {
-                    fork { loomToCoroutines { coroutineContext[CoroutineName]?.name } }
-                }.get()
-            }
-        }
-        assertEquals("across-the-fork", seen)
-    }
-
-    @Test
-    fun `a coroutine's own Job is not leaked into a nested runBlockingV2's context`() {
-        // each runBlockingV2 launches its own root Job; inheriting the *outer* Job would make the
-        // inner one a child of a coroutine that has already returned by the time the inner starts.
-        var outerJob: kotlinx.coroutines.Job? = null
-        var innerJob: kotlinx.coroutines.Job? = null
-        loomToCoroutines {
-            outerJob = coroutineContext[kotlinx.coroutines.Job]
-            loomToCoroutines {
-                innerJob = coroutineContext[kotlinx.coroutines.Job]
-            }
-        }
-        assertTrue(outerJob !== innerJob)
     }
 }

@@ -1,25 +1,44 @@
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.DisposableHandle
-import kotlinx.coroutines.ExecutorCoroutineDispatcher
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.InternalCoroutinesApi
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.launch
-import java.util.concurrent.Executor
+import kotlinx.coroutines.*
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.LockSupport
+import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
-import kotlin.jvm.Throws
+import kotlin.coroutines.EmptyCoroutineContext
 
+// The two crossing points between "plain blocking Loom code" and "coroutines". Deliberately not a
+// CoroutineDispatcher: dispatching every single hop through a Loom-aware dispatcher had real,
+// structural gaps (withContext's "undispatched" fast path skips dispatch() entirely so a
+// ScopedValue mirror kept going stale, Delay needed special-casing, cancellation-to-interruption
+// needed a hand-rolled state machine). Restricting Loom-awareness to just these two explicit
+// crossing points removes all of that: ScopedValues only need capturing/reinstalling right here,
+// and kotlinx.coroutines' own runInterruptible already does cancellation-to-interruption correctly,
+// so there's no dispatcher, no Delay concern, and no custom interrupt state machine to maintain.
+
+private val virtualThreadDispatcher = Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()
+
+// Mirrors "the CoroutineContext at the last loomToCoroutines/coroutinesToLoom crossing" as a real
+// ScopedValue, since code on the Loom side of the boundary has no other way to read it back: plain
+// CoroutineContext propagation only works within coroutine-land.
 private val contextAsScopedValue = ScopedValue.newInstance<CoroutineContext>()
 
+// Carries the ScopedValues captured where a Loom thread crossed into coroutines. Plain
+// CoroutineContext.Element propagation (not a thread-bound ScopedValue) is what lets this survive
+// dispatcher hops and suspensions without any special dispatcher.
+private class LoomBindingsElement(val bindings: ScopedBindings) : AbstractCoroutineContextElement(Key) {
+    companion object Key : CoroutineContext.Key<LoomBindingsElement>
+}
+
 /**
- * Enters the coroutine world.
- * This **WILL** block the thread, and **will** be expensive on platform threads.
+ * Enters the coroutine world, and opens the option to enter back into the Loom world through [coroutinesToLoom].
+ *
+ * It's important to note that without this, the [ScopedValue]s and interrupting semantics of Loom WILL go lost.
+ *
+ * So whenever you call a function that now, or might at some point in the future:
+ *  - Might block and require interrupting semantics
+ *  - Uses [ScopedValue]s under the hood.
+ * Then you must call [coroutinesToLoom] to return to the Loom world.
  */
 @Throws(InterruptedException::class)
 fun <T> loomToCoroutines(block: suspend CoroutineScope.() -> T): T {
@@ -38,11 +57,11 @@ fun <T> loomToCoroutines(block: suspend CoroutineScope.() -> T): T {
 
     val inheritedContext =
         if (contextAsScopedValue.isBound) contextAsScopedValue.get().minusKey(Job)
-        else kotlin.coroutines.EmptyCoroutineContext
+        else EmptyCoroutineContext
 
     @OptIn(DelicateCoroutinesApi::class)
     val job = GlobalScope.launch(
-        LoomCompatibleCoroutineDispatcher(captureAllScopedValueBindings()).plus(inheritedContext)
+        LoomBindingsElement(captureAllScopedValueBindings()).plus(inheritedContext)
     ) {
         result.state = try {
             block()
@@ -59,7 +78,6 @@ fun <T> loomToCoroutines(block: suspend CoroutineScope.() -> T): T {
     do {
         LockSupport.park()
     } while (!thread.isInterrupted && !wasUnparked.get())
-
 
     if (Thread.interrupted()) {
         job.cancel()
@@ -80,72 +98,24 @@ fun <T> loomToCoroutines(block: suspend CoroutineScope.() -> T): T {
     return result.state as T
 }
 
-// A Dispatchers.Default-like dispatcher backed by one virtual thread per dispatched task, so each
-// task's thread is exclusively its own (no reuse) - which is what makes physically interrupting it
-// on cancellation safe. Every dispatch() call: (1) carries over whatever ScopedValues are bound on
-// the calling thread, via captureAllScopedValueBindings/overwriteAllValues, and (2) interrupts its
-// worker thread the moment the coroutine's Job starts cancelling, so blocking calls that don't
-// otherwise participate in cooperative cancellation (Thread.sleep, StructuredTaskScope.join, ...)
-// wake up immediately instead of running to completion unnoticed.
-private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : ExecutorCoroutineDispatcher() {
-    companion object {
-        private val executorService = Executors.newVirtualThreadPerTaskExecutor()
-        private val delegate = executorService.asCoroutineDispatcher()
-    }
-
-
-    override val executor: Executor get() = executorService
-
-    override fun dispatch(context: CoroutineContext, block: Runnable) {
-        val job = context[Job]
-        delegate.dispatch(context) {
-            var handle: DisposableHandle? = null
-            // Same 4-state handshake kotlinx.coroutines' own runInterruptible uses internally (see its
-            // ThreadState): a cancellation can race with the task's natural completion, so this guarantees we
-            // never interrupt a thread that has already moved on, and never leave a stray interrupt flag set
-            // once clear() returns.
-            val state = AtomicInteger(WORKING)
-            if (job != null) {
-                val targetThread = Thread.currentThread()
-                @OptIn(InternalCoroutinesApi::class)
-                handle = job.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
-                    if (cause != null && state.compareAndSet(WORKING, INTERRUPTING)) {
-                        targetThread.interrupt()
-                        state.set(INTERRUPTED)
-                    }
-                }
-            }
-            try {
-                bindings.overwriteAllValues {
-                    ScopedValue.where(contextAsScopedValue, context).run {
-                        block.run()
-                    }
-                }
-            } finally {
-                if (job != null) {
-                    while (true) {
-                        when (state.get()) {
-                            WORKING -> if (state.compareAndSet(WORKING, FINISHED)) {
-                                handle?.dispose()
-                                break
-                            }
-                            INTERRUPTING -> Thread.onSpinWait()
-                            else -> { // INTERRUPTED
-                                Thread.interrupted() // drop the flag so it can't leak past this task
-                                break
-                            }
-                        }
-                    }
+// Runs block on a fresh virtual thread (via runInterruptible(virtualThreadDispatcher)), with the
+// ScopedValues captured at the enclosing loomToCoroutines reinstalled, and this coroutine's own
+// CoroutineContext re-exposed as contextAsScopedValue so a nested loomToCoroutines called from
+// within block can find it. Cancelling this coroutine while block runs interrupts that thread -
+// courtesy of runInterruptible, not anything custom here.
+suspend fun <T> coroutinesToLoom(unwrapExecutionException: Boolean = true, block: () -> T): T {
+    val context = currentCoroutineContext()
+    val bindings = context[LoomBindingsElement]?.bindings
+    return runInterruptible(virtualThreadDispatcher) {
+        val withContextExposed: () -> T = {
+            ScopedValue.where(contextAsScopedValue, context).call<T, Throwable> {
+                try {
+                    block()
+                } catch (e: ExecutionException) {
+                    throw if (unwrapExecutionException) (e.cause ?: e) else e
                 }
             }
         }
+        bindings?.overwriteAllValues(withContextExposed) ?: withContextExposed()
     }
-
-    override fun close() = TODO("Idk why this would happen atm")
 }
-
-private const val WORKING = 0
-private const val FINISHED = 1
-private const val INTERRUPTING = 2
-private const val INTERRUPTED = 3
-
