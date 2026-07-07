@@ -6,10 +6,7 @@ import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
-import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -141,21 +138,6 @@ private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : 
     }
 
     override fun close() = TODO("Idk why this would happen atm")
-}
-
-suspend fun <T> coroutinesToLoom(unwrapExecutionException: Boolean = true, block: () -> T): T {
-    return try {
-        ScopedValue.where(contextAsScopedValue, currentCoroutineContext()).call<T, Throwable> {
-            block()
-        }
-    } catch (t: Throwable) {
-        val job = currentCoroutineContext().job
-        val exception = if (unwrapExecutionException) (t as? ExecutionException)?.cause ?: t else t
-        @OptIn(InternalCoroutinesApi::class)
-        throw if (job.isActive) {
-            job.getCancellationException().apply { addSuppressed(exception) }
-        } else exception
-    }
 }
 
 private const val WORKING = 0

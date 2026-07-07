@@ -17,7 +17,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTime
 
-class RunBlockingV2Test {
+class LoomBridgeTest {
 
     // ------------------------------------------------------------------
     // Basics: return values, exceptions, ScopedValues, thread interruption
