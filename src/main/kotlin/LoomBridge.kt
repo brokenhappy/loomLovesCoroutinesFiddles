@@ -80,13 +80,9 @@ fun <T> loomToCoroutines(block: suspend CoroutineScope.() -> T): T {
     return result.state as T
 }
 
-// A Dispatchers.Default-like dispatcher backed by one virtual thread per dispatched task, so each
-// task's thread is exclusively its own (no reuse) - which is what makes physically interrupting it
-// on cancellation safe. Every dispatch() call: (1) carries over whatever ScopedValues are bound on
+// A dispatcher where every dispatch() call: (1) carries over whatever ScopedValues are bound on
 // the calling thread, via captureAllScopedValueBindings/overwriteAllValues, and (2) interrupts its
-// worker thread the moment the coroutine's Job starts cancelling, so blocking calls that don't
-// otherwise participate in cooperative cancellation (Thread.sleep, StructuredTaskScope.join, ...)
-// wake up immediately instead of running to completion unnoticed.
+// worker thread the moment the coroutine's Job starts cancelling
 private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : ExecutorCoroutineDispatcher() {
     companion object {
         private val executorService = Executors.newVirtualThreadPerTaskExecutor()
@@ -100,10 +96,6 @@ private class LoomCompatibleCoroutineDispatcher(val bindings: ScopedBindings) : 
         val job = context[Job]
         delegate.dispatch(context) {
             var handle: DisposableHandle? = null
-            // Same 4-state handshake kotlinx.coroutines' own runInterruptible uses internally (see its
-            // ThreadState): a cancellation can race with the task's natural completion, so this guarantees we
-            // never interrupt a thread that has already moved on, and never leave a stray interrupt flag set
-            // once clear() returns.
             val state = AtomicInteger(WORKING)
             if (job != null) {
                 val targetThread = Thread.currentThread()
