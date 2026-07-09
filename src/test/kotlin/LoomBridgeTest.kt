@@ -1,18 +1,27 @@
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import loom.loomToCoroutines
+import org.junit.jupiter.api.Nested
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import javax.naming.Context
+import kotlin.assert
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -43,7 +52,7 @@ class LoomBridgeTest {
         class Boom : RuntimeException()
         assertFailsWith<Boom> {
             loomToCoroutines {
-                yield() // force a real suspend+resume before throwing
+                yield() /** See [KnownLimitations.`a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`] */
                 throw Boom()
             }
         }
@@ -293,7 +302,7 @@ class LoomBridgeTest {
                 val expected = "caller-$i"
                 val seen = ScopedValue.where(requestId, expected).call<String, RuntimeException> {
                     loomToCoroutines {
-                        yield() // give other callers a chance to interleave before reading back
+                        yield() /** See [KnownLimitations.`a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`] */
                         requestId.get()
                     }
                 }
@@ -313,34 +322,18 @@ class LoomBridgeTest {
     @Test
     fun `a top-level runBlockingV2 with nothing bound just runs with an empty context`() {
         val name = loomToCoroutines { coroutineContext[CoroutineName]?.name }
-        assertEquals(null, name)
+        assertNull(name)
     }
 
     @Test
     fun `a nested runBlockingV2 inherits CoroutineContext elements from the enclosing coroutine`() {
         val seen = loomToCoroutines {
             withContext(CoroutineName("outer-name")) {
-                yield() // force a real redispatch - see the "KNOWN LIMITATION" test below for why
+                yield() /** See [KnownLimitations.`a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`] */
                 loomToCoroutines { coroutineContext[CoroutineName]?.name }
             }
         }
         assertEquals("outer-name", seen)
-    }
-
-    @Test
-    fun `KNOWN LIMITATION - a context change isn't visible to a nested runBlockingV2 without an intervening real dispatch`() {
-        // contextAsScopedValue is only rebound inside LoomCompatibleCoroutineDispatcher.dispatch().
-        // withContext(CoroutineName(...)) doesn't change the dispatcher, so kotlinx.coroutines takes
-        // its "undispatched" fast path and never calls dispatch() again - meaning a runBlockingV2
-        // called immediately afterward (no suspension in between) still sees the *old* ScopedValue
-        // snapshot. A real suspension point (yield(), delay(), a dispatcher switch, ...) in between
-        // fixes it, as the test above demonstrates.
-        val seen = loomToCoroutines {
-            withContext(CoroutineName("outer-name")) {
-                loomToCoroutines { coroutineContext[CoroutineName]?.name }
-            }
-        }
-        assertEquals(null, seen)
     }
 
     @Test
@@ -351,10 +344,10 @@ class LoomBridgeTest {
 
         val seen = loomToCoroutines {
             withContext(outerName) {
-                yield()
+                yield() /** See [KnownLimitations.`a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`] */
                 loomToCoroutines {
                     withContext(CoroutineName("inner")) {
-                        yield()
+                        yield() /** See [KnownLimitations.`a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`] */
                         loomToCoroutines {
                             Seen(
                                 outer = coroutineContext[CoroutineName]?.name,
@@ -380,7 +373,7 @@ class LoomBridgeTest {
                 val expected = "caller-$i"
                 val seen = loomToCoroutines {
                     withContext(CoroutineName(expected)) {
-                        yield() // give other callers a chance to interleave
+                        yield() /** See [KnownLimitations.`a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`] */
                         loomToCoroutines { coroutineContext[CoroutineName]?.name }
                     }
                 }
@@ -397,7 +390,7 @@ class LoomBridgeTest {
     fun `CoroutineContext propagates through a Java StructuredTaskScope fork into a nested runBlockingV2`() {
         val seen = loomToCoroutines {
             withContext(CoroutineName("across-the-fork")) {
-                yield() // force a real redispatch so contextAsScopedValue picks up the new name
+                yield() /** See [KnownLimitations.`a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`] */
                 structuredTaskScope {
                     fork { loomToCoroutines { coroutineContext[CoroutineName]?.name } }
                 }.get()
@@ -419,5 +412,86 @@ class LoomBridgeTest {
             }
         }
         assertTrue(outerJob !== innerJob)
+    }
+
+    // contextAsScopedValue is only rebound inside LoomCompatibleCoroutineDispatcher.dispatch(). Each
+    // test here is a different way to resume a coroutine WITHOUT a real dispatch() call - one of
+    // kotlinx.coroutines' "undispatched" fast paths - which leaves that mirror stale, or in one case
+    // fully unbound. A real suspension point (yield(), delay(), ...) in between fixes the stale
+    // cases, as the "inherits CoroutineContext" test above demonstrates.
+    @Nested
+    inner class KnownLimitations {
+        @Test
+        fun `a context change isn't visible to a nested loomToCoroutines without an intervening real dispatch`() {
+            // withContext(CoroutineName(...)) doesn't change the dispatcher, so it takes the fast path.
+            val seen = loomToCoroutines {
+                withContext(CoroutineName("outer-name")) {
+                    // A yield() here would be a workaround
+                    loomToCoroutines { coroutineContext[CoroutineName]?.name }
+                }
+            }
+            assertNull(seen)
+        }
+
+        @Test
+        fun `launch(start = UNDISPATCHED) also skips the initial dispatch`() {
+            // Same fast path, hit at coroutine start instead of at withContext.
+            val seen = loomToCoroutines {
+                async(CoroutineName("child-name"), start = CoroutineStart.UNDISPATCHED) {
+                    // A yield() here would be a workaround
+                    loomToCoroutines { coroutineContext[CoroutineName]?.name }
+                }.await()
+            }
+            assertNull(seen)
+        }
+
+        // Switching to any dispatcher other than LoomCompatibleCoroutineDispatcher DOES force a
+        // real dispatch, but the overwritten dispatcher drops all semantics
+        @Nested
+        inner class DispatcherOverwritingLimitations {
+            @Test
+            fun `withContext(Dispatchers xyz) loses ScopedValue propagation`() {
+                val requestId = ScopedValue.newInstance<String>()
+                val seenBound = ScopedValue.where(requestId, "root").call<Boolean, RuntimeException> {
+                    loomToCoroutines {
+                        withContext(Dispatchers.Default) {
+                            yield() // Even this can't save it!
+                            loomToCoroutines { requestId.isBound }
+                        }
+                    }
+                }
+                assertFalse(seenBound)
+            }
+
+            @Test
+            fun `withContext(Dispatchers xyz) loses CoroutineContext propagation`() {
+                val seen = loomToCoroutines {
+                    withContext(CoroutineName("outer-name")) {
+                        withContext(Dispatchers.Default) {
+                            yield() // Even this can't save it!
+                            loomToCoroutines { coroutineContext[CoroutineName]?.name }
+                        }
+                    }
+                }
+                assertNull(seen)
+            }
+
+            @Test
+            fun `withContext(Dispatchers xyz) loses cancellation to interruption propagation`() {
+                val timeTakenToCancel = loomToCoroutines {
+                    withContext(CoroutineName("outer-name")) {
+                        withContext(Dispatchers.Default) {
+                            yield() // Even this can't save it!
+                            measureTime {
+                                launch {
+                                    Thread.sleep(20) // Technically a race condition, but shouldn't be likely
+                                }.cancelAndJoin()
+                            }
+                        }
+                    }
+                }
+                assert(timeTakenToCancel >= 20.milliseconds) { "Should take longer than 20ms, but took $timeTakenToCancel" }
+            }
+        }
     }
 }
